@@ -16,6 +16,7 @@ import www_authenticate
 import oci.auth as oa
 import oci.aws
 import oci.client
+import oci.digest
 import oci.model as om
 
 
@@ -419,7 +420,12 @@ class Client:
         absent_ok: bool=False,
         accept: str=None,
     ):
+        '''Return the manifest, verifying actual bytes for digest-addressed references.'''
         image_reference = om.OciImageReference.to_image_ref(image_reference)
+        verifier = (
+            oci.digest.DigestVerifier(image_reference.tag, image_reference)
+            if image_reference.has_digest_tag else None
+        )
 
         scope = oci.client._scope(image_reference=image_reference, action='pull')
 
@@ -447,6 +453,8 @@ class Client:
                 raise om.OciImageNotFoundException(e)
             raise e
 
+        if verifier:
+            return await oci.digest.verify_response_async(res, verifier)
         return res
 
     async def manifest(
@@ -577,16 +585,19 @@ class Client:
         image_reference: str | om.OciImageReference,
         accept: str=None,
     ):
+        '''Resolve tags from actual manifest bytes; existing pins are fetched and verified too.'''
         image_reference = om.OciImageReference.to_image_ref(image_reference)
-        if image_reference.has_digest_tag:
-            return str(image_reference)
-
         manifest_raw = await self.manifest_raw(
             image_reference=image_reference,
             accept=accept,
         )
-        manifest_content = await manifest_raw.content.read()
-        manifest_hash_digest = hashlib.sha256(manifest_content).hexdigest()
+        try:
+            if image_reference.has_digest_tag:
+                return str(image_reference)
+            manifest_content = await manifest_raw.read()
+            manifest_hash_digest = hashlib.sha256(manifest_content).hexdigest()
+        finally:
+            manifest_raw.close()
 
         prefix = image_reference.ref_without_tag
 
@@ -805,7 +816,9 @@ class Client:
         digest: str,
         absent_ok=False,
     ) -> aiohttp.ClientResponse | None:
+        '''Return verified blob bytes; streaming reads replay a bounded-memory local spool.'''
         image_reference = om.OciImageReference(image_reference)
+        verifier = oci.digest.DigestVerifier(digest, image_reference)
 
         scope = oci.client._scope(image_reference=image_reference, action='pull')
 
@@ -819,10 +832,15 @@ class Client:
         )
 
         if absent_ok and res.status == 404:
+            res.close()
             return None
-        res.raise_for_status()
+        try:
+            res.raise_for_status()
+        except BaseException:
+            res.close()
+            raise
 
-        return res
+        return await oci.digest.verify_response_async(res, verifier)
 
     async def head_blob(
         self,

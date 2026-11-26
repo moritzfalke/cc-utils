@@ -4,9 +4,12 @@ import time
 import unittest.mock
 
 import requests
+import pytest
 
 import oci.auth
 import oci.client as co
+import oci.digest
+from test._test_utils import content_digest, http_response
 
 
 def test_append_b64_padding_if_missing():
@@ -180,3 +183,95 @@ def test_batch_delete_manifests_aws():
     assert {'imageTag': 'v1'} in image_ids
     assert {'imageTag': 'v2'} in image_ids
     assert {'imageDigest': 'sha256:abcdef'} in image_ids
+
+
+@pytest.mark.parametrize('method', ['manifest', 'blob'])
+@pytest.mark.parametrize('matching', [False, True])
+def test_download_content_checks(method, matching, monkeypatch, no_network):
+    content = b'{"schemaVersion":2,"config":{},"layers":[]}'
+    received = content if matching else b'{"schemaVersion":1}'
+    expected = content_digest(content)
+    client = co.Client()
+    response = http_response(received)
+    monkeypatch.setattr(client, '_request', unittest.mock.Mock(return_value=response))
+
+    def download():
+        if method == 'manifest':
+            return client.manifest_raw(f'registry.example/image@{expected}')
+        return client.blob('registry.example/image:v1', expected)
+
+    if matching:
+        with download() as result:
+            assert isinstance(result, requests.Response)
+            assert result.json()['schemaVersion'] == 2
+            assert result.content == content
+            assert result.text == content.decode()
+    else:
+        with pytest.raises(oci.digest.DigestMismatchError):
+            download()
+    assert response.raw.closed
+
+
+@pytest.mark.parametrize('shape', ['symbolic', 'digest', 'mixed'])
+def test_manifest_reference_resolution(shape, monkeypatch, no_network):
+    content = b'{"schemaVersion":2}'
+    expected = content_digest(content)
+    reference = {
+        'symbolic': 'registry.example/image:v1',
+        'digest': f'registry.example/image@{expected}',
+        'mixed': f'registry.example/image:v1@{expected}',
+    }[shape]
+    result_reference = f'registry.example/image@{expected}' if shape == 'symbolic' else reference
+    response = http_response(content)
+    response.headers['Docker-Content-Digest'] = content_digest(b'header value')
+    client = co.Client()
+    request = unittest.mock.Mock(return_value=response)
+    monkeypatch.setattr(client, '_request', request)
+    assert client.to_digest_hash(reference) == result_reference
+    request.assert_called_once()
+
+
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('algorithm', ['sha256', 'sha512'])
+def test_blob_streaming_interfaces(stream, algorithm, monkeypatch, no_network):
+    content = b'example payload'
+    client = co.Client()
+    monkeypatch.setattr(client, '_request', unittest.mock.Mock(return_value=http_response(content)))
+    with client.blob(
+        'registry.example/image:v1', content_digest(content, algorithm), stream=stream,
+    ) as r:
+        assert r.raw.read(3, decode_content=True) == content[:3]
+        assert b''.join(r.iter_content(4)) == content[3:]
+
+
+def test_invalid_blob_digest_does_not_issue_a_request(monkeypatch, no_network):
+    client = co.Client()
+    request = unittest.mock.Mock()
+    monkeypatch.setattr(client, '_request', request)
+    with pytest.raises(ValueError):
+        client.blob('registry.example/image:v1', 'sha256:abcd')
+    request.assert_not_called()
+
+
+def test_missing_blob_response(monkeypatch, no_network):
+    client = co.Client()
+    response = http_response(b'', status=404)
+    monkeypatch.setattr(client, '_request', unittest.mock.Mock(return_value=response))
+    assert client.blob('registry.example/image:v1', content_digest(b''), absent_ok=True) is None
+    assert response.raw.closed
+
+
+@pytest.mark.parametrize('shape', ['digest', 'mixed'])
+@pytest.mark.parametrize('algorithm', ['sha256', 'sha512'])
+def test_reference_resolution_checks_content(shape, algorithm, monkeypatch, no_network):
+    expected = content_digest(b'example payload', algorithm)
+    tag = ':v1' if shape == 'mixed' else ''
+    reference = f'registry.example/image{tag}@{expected}'
+    response = http_response(b'other payload')
+    client = co.Client()
+    monkeypatch.setattr(client, '_request', unittest.mock.Mock(return_value=response))
+    with pytest.raises(oci.digest.DigestMismatchError) as error:
+        client.to_digest_hash(reference)
+    assert error.value.expected_digest == expected
+    assert error.value.actual_digest == content_digest(b'other payload', algorithm)
+    assert response.raw.closed
