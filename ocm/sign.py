@@ -10,10 +10,42 @@ import hashlib
 import json
 
 import ocm
+import ocm.access
 
 
 class DigestMismatchException(Exception):
     pass
+
+
+def verify_digest_spec(expected: ocm.DigestSpec, actual: ocm.DigestSpec):
+    '''Check the entire digest specification, including the algorithm's provenance.'''
+    if not isinstance(expected, ocm.DigestSpec) or not isinstance(actual, ocm.DigestSpec):
+        raise ValueError('Expected an OCM digest specification')
+    if dataclasses.asdict(expected) != dataclasses.asdict(actual):
+        raise DigestMismatchException(f'Calculated digest {actual} mismatches existing {expected}')
+
+
+def _check_exclusion(digest: ocm.DigestSpec | None, allow_excluded_resources: bool) -> bool:
+    if not digest:
+        return False
+    if not isinstance(digest, ocm.DigestSpec):
+        raise ValueError('Expected an OCM digest specification')
+    if (
+        digest.hashAlgorithm == ocm.NO_DIGEST
+        or digest.normalisationAlgorithm == ocm.EXCLUDE_FROM_SIGNATURE
+        or digest.value == ocm.NO_DIGEST
+    ):
+        if dataclasses.asdict(digest) != dataclasses.asdict(ocm.ExcludeFromSignatureDigest()):
+            raise ValueError('Invalid resource digest exclusion')
+        if not allow_excluded_resources:
+            raise ValueError('Excluded resource content requires explicit opt-in')
+        return True
+    return False
+
+
+def _check_normalisation(normalisation):
+    if normalisation != ocm.NormalisationAlgorithm.JSON_NORMALISATION:
+        raise ValueError(f'Unsupported component normalisation algorithm: {normalisation!r}')
 
 
 def normalise_obj(
@@ -48,7 +80,9 @@ def normalise_label(
 def normalise_resource(
     resource: ocm.Resource,
     access_to_digest_lookup: collections.abc.Callable[[ocm.Access], ocm.DigestSpec],
-    verify_digests: bool=False,
+    verify_digests: bool=True,
+    allow_excluded_resources: bool=False,
+    component: ocm.Component=None,
 ) -> list[dict]:
     resource_raw = dataclasses.asdict(resource)
 
@@ -61,34 +95,33 @@ def normalise_resource(
     else:
         del resource_raw['labels']
 
-    # digest is ignored in case no access is specified; otherwise, calculate digest if it is not
-    # existing yet
-    if resource.access:
-        if (
-            resource.digest
-            and verify_digests
-            and not (
-                resource.digest.hashAlgorithm == ocm.NO_DIGEST
-                and resource.digest.normalisationAlgorithm == ocm.EXCLUDE_FROM_SIGNATURE
-                and resource.digest.value == ocm.NO_DIGEST
+    excluded = _check_exclusion(resource.digest, allow_excluded_resources)
+    has_access = resource.access and resource.access.type not in (ocm.AccessType.NONE, 'none', None)
+    if not has_access:
+        if resource.digest and verify_digests and not excluded:
+            raise ValueError('Cannot verify a resource digest without content access')
+        del resource_raw['digest']
+    elif not excluded and (verify_digests or not resource.digest):
+        # Resolve only the lookup input. Access itself remains outside the signed form,
+        # and existing single-argument digest callbacks continue to work.
+        access = ocm.access.resolve_access(resource.access, component)
+        digest = access_to_digest_lookup(access)
+        if not isinstance(digest, ocm.DigestSpec):
+            raise ValueError('Expected an OCM digest specification from the content lookup')
+        calculated_exclusion = _check_exclusion(digest, allow_excluded_resources)
+        if not calculated_exclusion and (
+            digest.hashAlgorithm != 'SHA-256'
+            or digest.normalisationAlgorithm not in (
+                ocm.NormalisationAlgorithm.OCI_ARTIFACT_DIGEST,
+                ocm.NormalisationAlgorithm.GENERIC_BLOB_DIGEST,
             )
         ):
-            digest = access_to_digest_lookup(resource.access)
+            raise ValueError('Unsupported resource digest specification')
+        if resource.digest:
+            # Do not rewrite signed algorithm metadata using values from the lookup.
+            verify_digest_spec(resource.digest, digest)
+        else:
             resource_raw['digest'] = dataclasses.asdict(digest)
-
-            if resource.digest.value != digest.value:
-                e = DigestMismatchException(
-                    f'calculated digest {digest.value} mismatches existing digest '
-                    f'{resource.digest.value}'
-                )
-                e.add_note(f'{resource=}')
-                raise e
-
-        elif not resource.digest:
-            resource_raw['digest'] = dataclasses.asdict(access_to_digest_lookup(resource.access))
-
-    else:
-        del resource_raw['digest']
 
     # extra-identity is expected to be null instead of an empty object by OCM-cli in case it does
     # not contain any elements
@@ -102,9 +135,11 @@ def normalise_component_reference(
     component_reference: ocm.ComponentReference,
     component_descriptor_lookup: collections.abc.Callable[[ocm.ComponentIdentity], ocm.ComponentDescriptor], # noqa: E501
     access_to_digest_lookup: collections.abc.Callable[[ocm.Access], ocm.DigestSpec],
-    verify_digests: bool=False,
+    verify_digests: bool=True,
     normalisation: ocm.NormalisationAlgorithm=ocm.NormalisationAlgorithm.JSON_NORMALISATION,
+    allow_excluded_resources: bool=False,
 ) -> list[dict]:
+    _check_normalisation(normalisation)
     component_reference_raw = dataclasses.asdict(component_reference)
 
     if labels := [normalise_label(l) for l in component_reference.labels if l.signing]:
@@ -124,25 +159,18 @@ def normalise_component_reference(
             access_to_digest_lookup=access_to_digest_lookup,
             verify_digests=verify_digests,
             normalisation=normalisation,
+            allow_excluded_resources=allow_excluded_resources,
         )
 
-        component_reference_raw['digest'] = dataclasses.asdict(ocm.DigestSpec(
+        calculated_digest = ocm.DigestSpec(
             hashAlgorithm='SHA-256',
             normalisationAlgorithm=normalisation,
             value=digest,
-        ))
-
-    if (
-        verify_digests
-        and component_reference.digest
-        and component_reference.digest.value != digest
-    ):
-        e = DigestMismatchException(
-            f'calculated digest {digest} mismatches existing digest '
-            f'{component_reference.digest.value}'
         )
-        e.add_note(f'{component_reference=}')
-        raise e
+        if component_reference.digest:
+            verify_digest_spec(component_reference.digest, calculated_digest)
+        else:
+            component_reference_raw['digest'] = dataclasses.asdict(calculated_digest)
 
     # extra-identity is expected to be null instead of an empty object by OCM-cli in case it does
     # not contain any elements
@@ -156,9 +184,11 @@ def normalise_component(
     component: ocm.Component,
     component_descriptor_lookup: collections.abc.Callable[[ocm.ComponentIdentity], ocm.ComponentDescriptor], # noqa: E501
     access_to_digest_lookup: collections.abc.Callable[[ocm.Access], ocm.DigestSpec],
-    verify_digests: bool=False,
+    verify_digests: bool=True,
     normalisation: ocm.NormalisationAlgorithm=ocm.NormalisationAlgorithm.JSON_NORMALISATION,
+    allow_excluded_resources: bool=False,
 ) -> list[dict]:
+    _check_normalisation(normalisation)
     component_raw = dataclasses.asdict(component)
 
     # drop properties not relevant for signing
@@ -178,6 +208,7 @@ def normalise_component(
             access_to_digest_lookup=access_to_digest_lookup,
             verify_digests=verify_digests,
             normalisation=normalisation,
+            allow_excluded_resources=allow_excluded_resources,
         ) for cref in component.componentReferences
     ]
 
@@ -199,6 +230,8 @@ def normalise_component(
             resource=resource,
             access_to_digest_lookup=access_to_digest_lookup,
             verify_digests=verify_digests,
+            allow_excluded_resources=allow_excluded_resources,
+            component=component,
         ))
     component_raw['resources'] = resources
 
@@ -219,8 +252,9 @@ def normalise_component_descriptor(
     component_descriptor: ocm.ComponentDescriptor,
     component_descriptor_lookup: collections.abc.Callable[[ocm.ComponentIdentity], ocm.ComponentDescriptor], # noqa: E501
     access_to_digest_lookup: collections.abc.Callable[[ocm.Access], ocm.DigestSpec],
-    verify_digests: bool=False,
+    verify_digests: bool=True,
     normalisation: ocm.NormalisationAlgorithm=ocm.NormalisationAlgorithm.JSON_NORMALISATION,
+    allow_excluded_resources: bool=False,
 ) -> list[dict]:
     '''
     Returns a normalised version of the component descriptor by dropping signing-irrelevant
@@ -237,6 +271,8 @@ def normalise_component_descriptor(
         if set, verify already existing digests instead of assuming they are correct
     @param normalisation:
         the algorithm used to create a normalised representation of the component descriptor
+    @param allow_excluded_resources:
+        explicitly permit resources whose content is excluded from the signature
     '''
     component_descriptor_raw = dataclasses.asdict(component_descriptor)
 
@@ -250,6 +286,7 @@ def normalise_component_descriptor(
         access_to_digest_lookup=access_to_digest_lookup,
         verify_digests=verify_digests,
         normalisation=normalisation,
+        allow_excluded_resources=allow_excluded_resources,
     )
 
     return normalise_obj(component_descriptor_raw)
@@ -259,8 +296,9 @@ def component_descriptor_digest(
     component_descriptor: ocm.ComponentDescriptor,
     component_descriptor_lookup: collections.abc.Callable[[ocm.ComponentIdentity], ocm.ComponentDescriptor], # noqa: E501
     access_to_digest_lookup: collections.abc.Callable[[ocm.Access], ocm.DigestSpec],
-    verify_digests: bool=False,
+    verify_digests: bool=True,
     normalisation: ocm.NormalisationAlgorithm=ocm.NormalisationAlgorithm.JSON_NORMALISATION,
+    allow_excluded_resources: bool=False,
 ) -> str:
     '''
     Calculates the hexdigest of the recursively normalised component descriptor.
@@ -276,6 +314,8 @@ def component_descriptor_digest(
     @param normalisation:
         the algorithm used to create a normalised representation of the component descriptor as
         input for the digest calculation
+    @param allow_excluded_resources:
+        explicitly permit resources whose content is excluded from the signature
     '''
     normalised_component_descriptor = normalise_component_descriptor(
         component_descriptor=component_descriptor,
@@ -283,6 +323,7 @@ def component_descriptor_digest(
         access_to_digest_lookup=access_to_digest_lookup,
         verify_digests=verify_digests,
         normalisation=normalisation,
+        allow_excluded_resources=allow_excluded_resources,
     )
 
     serialised_component_descriptor = json.dumps(

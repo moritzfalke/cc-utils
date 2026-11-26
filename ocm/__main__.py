@@ -856,6 +856,7 @@ def _normalise(parsed) -> tuple[ocm.ComponentDescriptor, str]:
         component_descriptor_lookup=component_descriptor_lookup,
         access_to_digest_lookup=access_to_digest_lookup,
         verify_digests=parsed.validate_digests,
+        allow_excluded_resources=getattr(parsed, 'allow_excluded_resources', False),
     )
 
     serialised_and_normalised = json.dumps(
@@ -900,6 +901,15 @@ def validate(parsed):
 
     for signature in component_descriptor.signatures:
         print(f'checking {signature.name=}')
+        try:
+            ocm.sign.verify_digest_spec(signature.digest, ocm.DigestSpec(
+                hashAlgorithm='SHA-256',
+                normalisationAlgorithm=ocm.NormalisationAlgorithm.JSON_NORMALISATION,
+                value=digest.hex(),
+            ))
+        except ocm.sign.DigestMismatchException:
+            print(f'{signature.name=} has inconsistent digest metadata (will try other signatures)')
+            continue
         signature_bytes = parse_signature(signature.signature.value)
 
         for certificate in certificates:
@@ -1330,6 +1340,12 @@ def main():
         action='store_false',
         default=True,
         required=False,
+        help='Normalize metadata only; do not verify resource contents',
+    )
+    normalise_parser.add_argument(
+        '--allow-excluded-resources',
+        action='store_true',
+        help='Explicitly permit resources whose content is excluded from signing',
     )
 
     validate_parser = maincmd_parsers.add_parser(
@@ -1360,6 +1376,12 @@ def main():
         action='store_false',
         default=True,
         required=False,
+        help='Verify the metadata signature only; do not verify resource contents',
+    )
+    validate_parser.add_argument(
+        '--allow-excluded-resources',
+        action='store_true',
+        help='Explicitly permit resources whose content is excluded from signing',
     )
     # todo: allow passing normalised component-descriptor from filesystem as alternative to
     #       retrieving from OCM-Repository

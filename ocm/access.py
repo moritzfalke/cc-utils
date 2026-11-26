@@ -1,11 +1,18 @@
+import dataclasses
 import hashlib
+import typing
 import urllib.parse
 
 import ocm
 
 import ioutil
 import oci.client
+import oci.digest
 import oci.model
+
+
+if typing.TYPE_CHECKING:
+    import botocore.client
 
 
 def s3_access_as_blob_descriptor(
@@ -36,43 +43,126 @@ def s3_access_as_blob_descriptor(
     )
 
 
+def resolve_access(
+    access: ocm.Access,
+    component: ocm.Component=None,
+) -> ocm.Access:
+    '''Resolve component-relative access without changing the descriptor's signed representation.'''
+    try:
+        access_type = ocm.AccessType(access.type)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f'Unsupported access type: {access.type!r}') from e
+
+    if isinstance(access, dict):
+        access_class = {
+            ocm.AccessType.OCI_REGISTRY: ocm.OciAccess,
+            ocm.AccessType.OCI_BLOB: ocm.OciBlobAccess,
+            ocm.AccessType.LOCAL_BLOB: ocm.LocalBlobAccess,
+            ocm.AccessType.RELATIVE_OCI_REFERENCE: ocm.RelativeOciAccess,
+            ocm.AccessType.S3: ocm.S3Access,
+            ocm.AccessType.S3_V2: ocm.S3Access,
+        }.get(access_type)
+        if not access_class:
+            raise ValueError(f'Unsupported access type: {access.type!r}')
+        if access_type in (ocm.AccessType.S3, ocm.AccessType.S3_V2) and 'bucketName' in access:
+            access_class = ocm.LegacyS3Access
+        try:
+            access = access_class(**(dict(access) | {'type': access_type}))
+        except TypeError as e:
+            raise ValueError('Invalid resource access specification') from e
+    elif dataclasses.is_dataclass(access):
+        access = dataclasses.replace(access, type=access_type)
+
+    if access_type is ocm.AccessType.RELATIVE_OCI_REFERENCE:
+        if not component or not component.current_ocm_repo:
+            raise ValueError('Relative OCI access requires the owning component repository')
+        return to_absolute_oci_access(access, component.current_ocm_repo)
+
+    if access_type is not ocm.AccessType.LOCAL_BLOB:
+        return access
+
+    # Both the local and global access paths must identify the same blob. A global
+    # access may refer back to another repository after copy-by-reference replication.
+    local_digest = oci.digest.DigestVerifier(
+        access.localReference, 'localBlob',
+    ).expected_digest
+    if global_access := access.globalAccess:
+        if isinstance(global_access, dict):
+            try:
+                global_access = ocm.LocalBlobGlobalAccess(**global_access)
+            except TypeError as e:
+                raise ValueError('Invalid local blob global access') from e
+        try:
+            global_type = ocm.AccessType(global_access.type)
+        except (ValueError, TypeError) as e:
+            raise ValueError('Unsupported local blob global access type') from e
+        if global_type is not ocm.AccessType.OCI_BLOB:
+            raise ValueError('Unsupported local blob global access type')
+        global_digest = oci.digest.DigestVerifier(
+            global_access.digest, global_access.ref,
+        ).expected_digest
+        if local_digest != global_digest:
+            raise ValueError('Local and global blob references must identify the same content')
+        return ocm.OciBlobAccess(
+            imageReference=global_access.ref,
+            digest=global_digest,
+            size=global_access.size,
+            mediaType=global_access.mediaType,
+        )
+
+    if not component or not component.current_ocm_repo:
+        raise ValueError('Local blob access requires the owning component repository')
+    return ocm.OciBlobAccess(
+        imageReference=component.current_ocm_repo.component_version_oci_ref(component),
+        digest=local_digest,
+        size=access.size,
+        mediaType=access.mediaType,
+    )
+
+
 def access_to_digest_lookup(
     access: ocm.Access,
     oci_client: oci.client.Client=None,
     s3_client: 'botocore.client.S3'=None,
     chunk_size: int=8192,
+    component: ocm.Component=None,
 ) -> ocm.DigestSpec:
-    if access.type is ocm.AccessType.OCI_REGISTRY:
-        image_reference = oci.model.OciImageReference(
-            image_reference=oci_client.to_digest_hash(
+    '''Calculate a digest from fetched content, never from access metadata alone.'''
+    access = resolve_access(access, component)
+    access_type = ocm.AccessType(access.type)
+    if access_type in (ocm.AccessType.OCI_REGISTRY, ocm.AccessType.OCI_BLOB):
+        if not oci_client:
+            raise ValueError('OCI access requires an OCI client')
+        digest = hashlib.sha256()
+        if access_type is ocm.AccessType.OCI_REGISTRY:
+            response = oci_client.manifest_raw(
                 image_reference=access.imageReference,
                 accept=oci.model.MimeTypes.prefer_multiarch,
             )
-        )
-
-        digest = image_reference.digest
-
+            normalisation = ocm.NormalisationAlgorithm.OCI_ARTIFACT_DIGEST
+        else:
+            response = oci_client.blob(
+                image_reference=access.imageReference,
+                digest=access.digest,
+            )
+            normalisation = ocm.NormalisationAlgorithm.GENERIC_BLOB_DIGEST
+        try:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                digest.update(chunk)
+        finally:
+            response.close()
         return ocm.DigestSpec(
             hashAlgorithm='SHA-256',
-            normalisationAlgorithm=ocm.NormalisationAlgorithm.OCI_ARTIFACT_DIGEST,
-            value=digest,
+            normalisationAlgorithm=normalisation,
+            value=digest.hexdigest(),
         )
 
-    elif access.type is ocm.AccessType.LOCAL_BLOB:
-        reference = access.globalAccess.digest if access.globalAccess else access.localReference
-
-        digest = reference.lower().removeprefix('sha256:')
-
-        return ocm.DigestSpec(
-            hashAlgorithm='SHA-256',
-            normalisationAlgorithm=ocm.NormalisationAlgorithm.GENERIC_BLOB_DIGEST,
-            value=digest,
-        )
-
-    elif access.type in (
+    elif access_type in (
         ocm.AccessType.S3,
         ocm.AccessType.S3_V2,
     ):
+        if not s3_client:
+            raise ValueError('S3 access requires an S3 client')
         if isinstance(access, ocm.LegacyS3Access):
             bucket = access.bucketName
             key = access.objectKey
@@ -83,8 +173,11 @@ def access_to_digest_lookup(
         blob = s3_client.get_object(Bucket=bucket, Key=key)['Body']
 
         digest = hashlib.sha256()
-        for chunk in blob.iter_chunks(chunk_size=chunk_size):
-            digest.update(chunk)
+        try:
+            for chunk in blob.iter_chunks(chunk_size=chunk_size):
+                digest.update(chunk)
+        finally:
+            blob.close()
 
         return ocm.DigestSpec(
             hashAlgorithm='SHA-256',
@@ -92,7 +185,7 @@ def access_to_digest_lookup(
             value=digest.hexdigest(),
         )
 
-    return ocm.ExcludeFromSignatureDigest()
+    raise ValueError(f'Unsupported access type: {access.type!r}')
 
 
 def artifact_url(
