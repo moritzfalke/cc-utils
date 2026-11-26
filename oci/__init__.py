@@ -13,6 +13,7 @@ import requests
 import oci.auth as oa
 import oci.client as oc
 import oci.convert as oconv
+import oci.digest
 import oci.model as om
 import oci.platform as op
 
@@ -83,7 +84,7 @@ def _replicate_manifest_list(
     mode: ReplicationMode,
     platform_filter: collections.abc.Callable[[om.OciPlatform], bool] | None,
     annotations: dict[str, str] | None,
-) -> tuple[requests.Response, om.OciImageReference, bytes]:
+) -> tuple[requests.Response, om.OciImageReference, bytes, bool]:
     src_name = src_image_reference.ref_without_tag
     tgt_name = tgt_image_reference.ref_without_tag
     manifest_dirty = False
@@ -113,7 +114,7 @@ def _replicate_manifest_list(
         if mode is ReplicationMode.PREFER_MULTIARCH:
             recursive_mode = ReplicationMode.PREFER_MULTIARCH
 
-        res, ref, submanifest_bytes = replicate_artifact(
+        res, ref, submanifest_bytes, submanifest_modified = _replicate_artifact(
             src_image_reference=src_reference,
             tgt_image_reference=tgt_reference,
             oci_client=client,
@@ -123,10 +124,17 @@ def _replicate_manifest_list(
 
         submanifest_digest = f'sha256:{hashlib.sha256(submanifest_bytes).hexdigest()}'
         if submanifest_digest != sub_manifest.digest:
+            if not submanifest_modified:
+                # Unmodified output must still satisfy the source index entry. This
+                # also permits a SHA-512 to SHA-256 address change for identical bytes.
+                verifier = oci.digest.DigestVerifier(sub_manifest.digest, src_reference)
+                verifier.update(submanifest_bytes)
+                verifier.verify()
             sub_manifest = dataclasses.replace(
                 sub_manifest,
                 digest=submanifest_digest,
                 size=len(submanifest_bytes),
+                mediaType=json.loads(submanifest_bytes).get('mediaType', sub_manifest.mediaType),
             )
             manifest_dirty = True
 
@@ -148,7 +156,7 @@ def _replicate_manifest_list(
         manifest=raw_manifest,
     )
 
-    return res, tgt_image_reference, raw_manifest.encode('utf-8')
+    return res, tgt_image_reference, raw_manifest.encode('utf-8'), manifest_dirty
 
 
 def _wrap_single_as_manifest_list(
@@ -157,7 +165,7 @@ def _wrap_single_as_manifest_list(
     client: oc.Client,
     media_type: str,
     annotations: dict[str, str] | None,
-) -> tuple[requests.Response, om.OciImageReference, bytes]:
+) -> tuple[requests.Response, om.OciImageReference, bytes, bool]:
     if not src_image_reference.has_digest_tag:
         src_image_reference = om.OciImageReference.to_image_ref(
             client.to_digest_hash(image_reference=src_image_reference)
@@ -170,7 +178,7 @@ def _wrap_single_as_manifest_list(
     # force digest-tag so the sub-manifest entry is addressable
     tgt_image_ref = f'{tgt_image_reference.ref_without_tag}@{src_image_reference.tag}'
 
-    res, ref, manifest_bytes = replicate_artifact(
+    res, ref, manifest_bytes, _ = _replicate_artifact(
         src_image_reference=src_image_reference,
         tgt_image_reference=tgt_image_ref,
         oci_client=client,
@@ -197,7 +205,7 @@ def _wrap_single_as_manifest_list(
         manifest=manifest_list_bytes,
     )
 
-    return res, tgt_image_reference, manifest_list_bytes
+    return res, tgt_image_reference, manifest_list_bytes, True
 
 
 def replicate_artifact(
@@ -242,6 +250,29 @@ def replicate_artifact(
 
     pass either `credentials_lookup`, `routes`, OR `oci_client`
     '''
+    return _replicate_artifact(
+        src_image_reference=src_image_reference,
+        tgt_image_reference=tgt_image_reference,
+        credentials_lookup=credentials_lookup,
+        routes=routes,
+        oci_client=oci_client,
+        mode=mode,
+        platform_filter=platform_filter,
+        annotations=annotations,
+    )[:3]
+
+
+def _replicate_artifact(
+    src_image_reference: str | om.OciImageReference,
+    tgt_image_reference: str | om.OciImageReference,
+    credentials_lookup: oa.credentials_lookup=None,
+    routes: oc.OciRoutes=oc.OciRoutes(),
+    oci_client: oc.Client=None,
+    mode: ReplicationMode=ReplicationMode.REGISTRY_DEFAULTS,
+    platform_filter: collections.abc.Callable[[om.OciPlatform], bool]=None,
+    annotations: dict[str, str]=None,
+) -> tuple[requests.Response, om.OciImageReference, bytes, bool]:
+    '''Internal replication result includes whether this code intentionally changed the manifest.'''
     if not (bool(credentials_lookup) ^ bool(oci_client)):
         raise ValueError('either credentials-lookup + routes, xor client must be passed')
 
@@ -257,19 +288,32 @@ def replicate_artifact(
         client = oci_client
 
     accept = mode.accept_header()
+    source_verifier = (
+        oci.digest.DigestVerifier(src_image_reference.tag, src_image_reference)
+        if src_image_reference.has_digest_tag else None
+    )
 
     # we need the unaltered manifest for verbatim replication
     resp = client.manifest_raw(
         image_reference=src_image_reference,
         accept=accept,
     )
-    raw_manifest = resp.text
+    try:
+        raw_manifest_bytes = resp.content
+        content_type = resp.headers.get('Content-Type')
+        if source_verifier:
+            source_verifier.update(raw_manifest_bytes)
+            source_verifier.verify()
+        raw_manifest = raw_manifest_bytes.decode('utf-8')
+    finally:
+        resp.close()
     manifest = json.loads(raw_manifest)
+    manifest_modified = False
 
     # workaround: some manifests do not contain `mediaType`
     #             -> fallback to Content-Type header
     if not 'mediaType' in manifest:
-        if (media_type := resp.headers.get('Content-Type')):
+        if (media_type := content_type):
             manifest['mediaType'] = media_type
 
     schema_version = int(manifest['schemaVersion'])
@@ -277,7 +321,25 @@ def replicate_artifact(
 
     if schema_version == 1:
         need_to_synthesise_cfg_blob = True
-        manifest = client.manifest(image_reference=src_image_reference)
+        manifest_modified = True
+        # Convert the verified snapshot, rather than fetching a second manifest.
+        manifest = dacite.from_dict(data_class=om.OciImageManifestV1, data=manifest)
+        manifest.layers = []
+        for layer in manifest.fsLayers:
+            head = client.head_blob(
+                image_reference=src_image_reference, digest=layer.blobSum, absent_ok=False,
+            )
+            try:
+                media_type = head.headers['Content-Type']
+                if media_type == 'application/octet-stream':
+                    media_type = 'application/vnd.docker.image.rootfs.diff.tar.gzip'
+                manifest.layers.append(om.OciBlobRef(
+                    digest=layer.blobSum,
+                    mediaType=media_type,
+                    size=int(head.headers['Content-Length']),
+                ))
+            finally:
+                head.close()
 
         logger.warning(
           f'''
@@ -426,6 +488,7 @@ def replicate_artifact(
     if annotations:
         if _apply_annotations(manifest, annotations):
             raw_manifest = json.dumps(manifest.as_dict())
+            manifest_modified = True
 
     manifest_digest = hashlib.sha256(raw_manifest.encode('utf-8')).hexdigest()
     tgt_image_reference = tgt_image_reference.with_new_digest(digest=manifest_digest)
@@ -435,7 +498,7 @@ def replicate_artifact(
         manifest=raw_manifest,
     )
 
-    return res, tgt_image_reference, raw_manifest.encode('utf-8')
+    return res, tgt_image_reference, raw_manifest.encode('utf-8'), manifest_modified
 
 
 def replicate_blobs(

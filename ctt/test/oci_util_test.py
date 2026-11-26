@@ -8,6 +8,7 @@ import json
 import pytest
 
 import ctt.oci_util
+from test._test_utils import http_response
 
 
 DOCKER_MANIFEST_V2 = 'application/vnd.docker.distribution.manifest.v2+json'
@@ -69,11 +70,7 @@ class FakeOciClient:
 
     def manifest_raw(self, image_reference, accept=None):
         raw, content_type = self._manifests[str(image_reference)]
-
-        class Response:
-            text = raw.decode('utf-8')
-            headers = {'Content-Type': content_type}
-        return Response()
+        return http_response(raw, content_type=content_type)
 
     def head_blob(self, image_reference, digest, absent_ok=True):
         # pretend blobs are always absent in the target repository
