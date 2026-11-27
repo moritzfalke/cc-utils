@@ -471,6 +471,10 @@ def _image_tag_from_resource(
     resource: ocm.Resource,
 ) -> str:
     '''Retain the resource's approved OCI identity when constructing image-vector tags.'''
+    resource_digest = resource.digest
+    if not resource_digest:
+        raise ValueError('Image-vector output requires a resource digest')
+
     # Inspect the path only: a registry port is not a symbolic image tag.
     path_without_digest = image_ref.urlparsed.path.rsplit('@', 1)[0]
     symbolic_tag = path_without_digest.rsplit(':', 1)[1] if ':' in path_without_digest else None
@@ -479,21 +483,16 @@ def _image_tag_from_resource(
         if image_ref.has_digest_tag else None
     )
 
-    if resource_digest := resource.digest:
-        algorithm = {'SHA-256': 'sha256', 'SHA-512': 'sha512'}.get(resource_digest.hashAlgorithm)
-        normalisation = resource_digest.normalisationAlgorithm
-        if not algorithm or normalisation != ocm.NormalisationAlgorithm.OCI_ARTIFACT_DIGEST:
-            raise ValueError('Image-vector output requires a supported OCI artifact digest')
-        approved_digest = oci.digest.DigestVerifier(
-            f'{algorithm}:{resource_digest.value}', image_ref,
-        ).expected_digest
-        if access_digest and access_digest != approved_digest:
-            raise oci.digest.DigestMismatchError(approved_digest, access_digest, image_ref)
-        return f'{symbolic_tag}@{approved_digest}' if symbolic_tag else approved_digest
-
-    if access_digest:
-        return f'{symbolic_tag}@{access_digest}' if symbolic_tag else access_digest
-    return image_ref.tag
+    algorithm = {'SHA-256': 'sha256', 'SHA-512': 'sha512'}.get(resource_digest.hashAlgorithm)
+    normalisation = resource_digest.normalisationAlgorithm
+    if not algorithm or normalisation != ocm.NormalisationAlgorithm.OCI_ARTIFACT_DIGEST:
+        raise ValueError('Image-vector output requires a supported OCI artifact digest')
+    approved_digest = oci.digest.DigestVerifier(
+        f'{algorithm}:{resource_digest.value}', image_ref,
+    ).expected_digest
+    if access_digest and access_digest != approved_digest:
+        raise oci.digest.DigestMismatchError(approved_digest, access_digest, image_ref)
+    return f'{symbolic_tag}@{approved_digest}' if symbolic_tag else approved_digest
 
 
 def image_dict_from_image_dict_and_resource(
@@ -505,6 +504,7 @@ def image_dict_from_image_dict_and_resource(
     creates an image-dict as understood by gardener as an imagevector-overwrite using an
     image-dict as read from `imagevector.gardener.cloud/images`-OCM-Label, and corresponding
     OCM-OCI-Image-Resource (use find_matching_oci_resource to determine valid inputs).
+    The resource must carry a supported OCI artifact digest.
     '''
     image_ref = oci.model.OciImageReference(resource.access.imageReference)
 
@@ -550,6 +550,8 @@ def oci_image_dict_from_resource(
 
     if resource_names is passed, only resources with matching names (honouring label, if configured)
     will be considered.
+
+    Selected resources must carry a supported OCI artifact digest.
     '''
     if not resource.type is ocm.ArtefactType.OCI_IMAGE:
         return None
@@ -603,6 +605,7 @@ def oci_image_dict_from_resource_regardless_of_label(
     like `oci_image_dict_from_resource`, but does not require the
     `imagevector.gardener.cloud/name`-label to be present, and uses the resource's name as-is.
     Used for `--select-images all` (image-vector command).
+    Selected resources must carry a supported OCI artifact digest.
     '''
     if not resource.type is ocm.ArtefactType.OCI_IMAGE:
         return None

@@ -1,12 +1,20 @@
+import functools
+from unittest.mock import Mock
+
 import pytest
 
 import oci.digest
 import ocm
 import ocm.gardener as og
+import ocm.access
+import ocm.sign
 from test._test_utils import content_digest
 
 
 OCI_REPO = ocm.OciOcmRepository(baseUrl='acme.org/ocm')
+IMAGE_DIGEST = content_digest(b'example image manifest')
+IMAGE_TAG = f'tag@{IMAGE_DIGEST}'
+_DEFAULT_DIGEST = object()
 
 
 def test_eval_version_template():
@@ -39,8 +47,10 @@ def res(
             value='version-from-label',
         ),
     ),
-    digest=None,
+    digest=_DEFAULT_DIGEST,
 ) -> ocm.Resource:
+    if digest is _DEFAULT_DIGEST:
+        digest = ocm.DigestSpec.from_oci_artifact_digest(IMAGE_DIGEST)
     return ocm.Resource(
         name=name,
         version=version,
@@ -61,7 +71,7 @@ def test_oci_image_dict_from_resource():
     ) == {
         'name': 'name-from-label',
         'repository': 'acme.org/image-ref',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
         'targetVersion': 'version-from-label',
     }
 
@@ -74,7 +84,7 @@ def test_oci_image_dict_from_resource():
     ) == {
         'name': 'name-from-label',
         'repository': 'acme.org/image-ref',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
         'targetVersion': 'version-from-label',
     }
 
@@ -93,7 +103,7 @@ def test_oci_image_dict_from_resource():
     ) == {
         'name': 'name-from-label',
         'repository': 'acme.org/image-ref',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
         'targetVersion': '1.2.3',
     }
 
@@ -106,7 +116,7 @@ def test_oci_image_dict_from_resource():
     ) == {
         'name': 'resource-name',
         'repository': 'acme.org/image-ref',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
         'targetVersion': 'version-from-label',
     }
 
@@ -122,7 +132,7 @@ def test_oci_image_dict_from_resource():
     ) == {
         'name': 'name-from-label',
         'repository': 'acme.org/relative/image-ref',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
         'targetVersion': 'version-from-label',
     }
 
@@ -134,7 +144,7 @@ def test_oci_image_dict_from_resource_regardless_of_label():
     ) == {
         'name': 'resource-name',
         'repository': 'acme.org/image-ref',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
     }
 
     # non-OCI-image resources are skipped
@@ -157,7 +167,7 @@ def test_oci_image_dict_from_resource_regardless_of_label():
     ) == {
         'name': 'resource-name',
         'repository': 'acme.org/relative/image-ref',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
     }
 
 
@@ -172,7 +182,7 @@ def test_image_dict_from_image_dict_and_resource():
         'name': 'iname',
         'repository': 'acme.org/image-ref',
         'sourceRepository': 'cname',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
     }
 
     # labels should be retained
@@ -187,7 +197,7 @@ def test_image_dict_from_image_dict_and_resource():
         'name': 'iname',
         'repository': 'acme.org/image-ref',
         'sourceRepository': 'cname',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
         'labels': [{'name': 'some-label', 'value': 42}],
     }
 
@@ -203,7 +213,7 @@ def test_image_dict_from_image_dict_and_resource():
         'name': 'iname',
         'repository': 'acme.org/image-ref',
         'sourceRepository': 'cname',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
         'targetVersion': 'tversion',
     }
 
@@ -302,10 +312,43 @@ def test_image_dict_sha512_digest(builder, no_network):
 
 
 @pytest.mark.parametrize('builder', ['reference', 'labelled', 'unlabelled'])
-def test_image_dict_mixed_reference_without_resource_digest(builder, no_network):
+@pytest.mark.parametrize('shape', ['symbolic', 'mixed', 'digest', 'untagged'])
+def test_image_dict_requires_resource_digest(builder, shape, no_network):
     expected = content_digest(b'example image manifest')
-    resource = res(access=ocm.OciAccess(imageReference=f'registry.example/image:v1@{expected}'))
-    assert _image_dict(builder, resource)['tag'] == f'v1@{expected}'
+    reference = {
+        'symbolic': 'registry.example/image:v1',
+        'mixed': f'registry.example/image:v1@{expected}',
+        'digest': f'registry.example/image@{expected}',
+        'untagged': 'registry.example/image',
+    }[shape]
+    resource = res(access=ocm.OciAccess(imageReference=reference), digest=None)
+    with pytest.raises(ValueError, match='requires a resource digest'):
+        _image_dict(builder, resource)
+
+
+@pytest.mark.parametrize('builder', ['labelled', 'unlabelled'])
+def test_image_dict_relative_access_requires_resource_digest(builder, no_network):
+    resource = res(access=ocm.RelativeOciAccess(reference='image:v1'), digest=None)
+    with pytest.raises(ValueError, match='requires a resource digest'):
+        _image_dict(builder, resource)
+
+
+@pytest.mark.parametrize('builder', ['reference', 'labelled', 'unlabelled'])
+def test_image_dict_normalization_requires_resource_metadata(
+    builder, component_descriptor_factory, content_client, no_network,
+):
+    content = b'{"schemaVersion":2}'
+    resource = res(digest=None)
+    descriptor = component_descriptor_factory([resource])
+    client, _ = content_client(content)
+    normalized = ocm.sign.normalise_component_descriptor(
+        descriptor, Mock(),
+        functools.partial(ocm.access.access_to_digest_lookup, oci_client=client),
+    )
+    assert normalized
+    assert resource.digest is None
+    with pytest.raises(ValueError, match='requires a resource digest'):
+        _image_dict(builder, resource)
 
 
 def test_iter_image_dicts_from_image_dicts_and_resources():
@@ -325,7 +368,7 @@ def test_iter_image_dicts_from_image_dicts_and_resources():
     assert result == {
         'name': 'resource-name',
         'repository': 'acme.org/image-ref',
-        'tag': 'tag',
+        'tag': IMAGE_TAG,
         'sourceRepository': 'acme.org/other-component',
     }
 
@@ -396,13 +439,13 @@ def test_iter_oci_image_dicts_from_component():
         { # this image-dict is yielded from root_component's sub-component-reference
             'name': 'referenced-component-res-name',
             'repository': 'acme.org/image-ref',
-            'tag': 'tag',
+            'tag': IMAGE_TAG,
             'sourceRepository': 'acme.org/referenced-component',
         },
         { # this image-dict is yielded from root-component's resource
             'name': 'name-from-label',
             'repository': 'acme.org/image-ref',
-            'tag': 'tag',
+            'tag': IMAGE_TAG,
             'targetVersion': 'version-from-label',
         }
     )
@@ -431,4 +474,4 @@ def test_iter_oci_image_dicts_from_rooted_component_relative_access():
 
     assert len(result) == 1
     assert result[0]['repository'] == 'acme.org/relative/image'
-    assert result[0]['tag'] == 'tag'
+    assert result[0]['tag'] == IMAGE_TAG

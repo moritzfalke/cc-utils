@@ -109,10 +109,18 @@ def test_normalise_exclusion_option(
 
 
 @pytest.mark.parametrize('selection', ['reference', 'labelled', 'unlabelled'])
+@pytest.mark.parametrize('with_digest', [False, True], ids=['missing-digest', 'resource-digest'])
+@pytest.mark.parametrize('pinned_access', [False, True], ids=['symbolic-access', 'mixed-access'])
 def test_image_vector_output(
-    selection, resource_factory, component_descriptor_factory, monkeypatch, capsys,
+    selection, with_digest, pinned_access,
+    resource_factory, component_descriptor_factory, monkeypatch, capsys,
 ):
     resource = resource_factory()
+    expected_tag = f'v1@sha256:{resource.digest.value}'
+    if pinned_access:
+        resource.access.imageReference += f'@sha256:{resource.digest.value}'
+    if not with_digest:
+        resource.digest = None
     if selection == 'labelled':
         resource.labels = [ocm.Label(name='imagevector.gardener.cloud/name', value='example')]
     root = component_descriptor_factory([resource])
@@ -146,11 +154,16 @@ def test_image_vector_output(
         '--root-name', 'example.org/component:1.0.0', '--recursive',
         '--select-images', 'all' if selection == 'unlabelled' else 'by-label',
     ])
-    cli.main()
-    output = yaml.safe_load(capsys.readouterr().out)
-    assert len(output['images']) == 1
-    image = output['images'][0]
-    assert image['repository'] == 'registry.example/image'
-    assert image['tag'] == f'v1@sha256:{resource.digest.value}'
+    if with_digest:
+        cli.main()
+        output = yaml.safe_load(capsys.readouterr().out)
+        assert len(output['images']) == 1
+        image = output['images'][0]
+        assert image['repository'] == 'registry.example/image'
+        assert image['tag'] == expected_tag
+    else:
+        with pytest.raises(ValueError, match='requires a resource digest'):
+            cli.main()
+        assert not capsys.readouterr().out
     client.manifest_raw.assert_not_called()
     client.blob.assert_not_called()
