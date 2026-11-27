@@ -2,6 +2,7 @@ import dataclasses
 import enum
 
 import oci.model
+import oci.digest
 import ocm
 
 
@@ -53,6 +54,7 @@ class ReplicationResourceElement(ReplicationResourceOptions):
 
     @property
     def src_ref(self) -> oci.model.OciImageReference:
+        '''The original access reference, used for uploader naming and metadata.'''
         if self.source.access.type is ocm.AccessType.OCI_REGISTRY:
             return oci.model.OciImageReference(self.source.access.imageReference)
         elif self.source.access.type is ocm.AccessType.RELATIVE_OCI_REFERENCE:
@@ -64,6 +66,30 @@ class ReplicationResourceElement(ReplicationResourceOptions):
             return oci.model.OciImageReference(full_ref, normalise=False)
         else:
             raise ValueError(self.source.access.type)
+
+    @property
+    def replication_src_ref(self) -> oci.model.OciImageReference:
+        '''Select the source content using its qualified OCI resource digest.'''
+        reference = self.src_ref
+        digest = self.source.digest
+        if not isinstance(digest, ocm.DigestSpec):
+            raise ValueError('CTT replication requires a resource digest')
+        algorithm = {'SHA-256': 'sha256', 'SHA-512': 'sha512'}.get(digest.hashAlgorithm)
+        normalisation = digest.normalisationAlgorithm
+        if not algorithm or normalisation != ocm.NormalisationAlgorithm.OCI_ARTIFACT_DIGEST:
+            raise ValueError('CTT replication requires a supported OCI artifact digest')
+        approved = oci.digest.DigestVerifier(
+            f'{algorithm}:{digest.value}', reference,
+        ).expected_digest
+        if reference.has_digest_tag:
+            access_digest = oci.digest.DigestVerifier(reference.tag, reference).expected_digest
+            # Different hash algorithms cannot be compared without content. In that
+            # case the qualified resource digest remains the authoritative address.
+            if access_digest.startswith(f'{algorithm}:') and access_digest != approved:
+                raise oci.digest.DigestMismatchError(approved, access_digest, reference)
+        return oci.model.OciImageReference(
+            f'{reference.ref_without_tag}@{approved}', normalise=False,
+        )
 
     @property
     def tgt_ref(self) -> oci.model.OciImageReference:
@@ -105,7 +131,7 @@ class ReplicationResourceElement(ReplicationResourceOptions):
     def __str__(self) -> str:
         return (
             f'{self.source.name}:{self.source.version} '
-            f'[{self.src_ref} -> {self.preliminary_tgt_ref}]'
+            f'[{self.replication_src_ref} -> {self.preliminary_tgt_ref}]'
         )
 
 
@@ -150,7 +176,7 @@ class ReplicationPlanStep:
             for resource in sorted(
                 self.resources,
                 key=lambda resource: (resource.source.name, resource.source.version),
-            ) if not resource.digest # only show resources which don't exist in target yet
+            )
         )
 
         return f'''\

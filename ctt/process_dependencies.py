@@ -31,6 +31,7 @@ import sbom.inject as sbom_inject
 import sbom.s3 as sbom_s3
 import oci
 import oci.client
+import oci.digest
 import oci.model as om
 import oci.workarounds
 import ocm
@@ -448,8 +449,39 @@ def determine_changed_components(
 
 
 uploaded_image_refs_to_digests = {}  # <ref>:<digest>
-uploaded_image_refs_to_ready_events = {}  # <ref>:<event> (set if digest is available)
+uploaded_image_refs_to_source_refs = {}  # <ref>: (qualified source ref, replication mode)
+uploaded_image_refs_to_ready_events = {}  # <ref>:<event> (uploads currently in progress)
 upload_image_lock = threading.Lock()
+
+
+def _reusable_upload(
+    resource: ctt.model.ReplicationResourceElement,
+    replication_mode: oci.ReplicationMode,
+    platform_filter,
+    inject_coordinates: bool,
+) -> bool:
+    # Requests depending on transformations, callbacks, or local files are processed
+    # again; their output cannot be identified by the source reference alone.
+    return not (
+        resource.remove_files or resource.remove_file_globs or resource.strip_manifest_attributes
+        or resource.append_files or platform_filter or inject_coordinates
+        or replication_mode is oci.ReplicationMode.NORMALISE_TO_MULTIARCH
+    )
+
+
+def _verified_existing_manifest(oci_client, target_ref, source_ref, mode) -> str | None:
+    response = oci_client.manifest_raw(image_reference=target_ref, accept=mode.accept_header())
+    try:
+        raw = response.content
+        verifier = oci.digest.DigestVerifier(source_ref.tag, target_ref)
+        verifier.update(raw)
+        verifier.verify()
+        # Legacy input still needs format conversion even when identical content exists.
+        if json.loads(raw).get('schemaVersion') != 2:
+            return None
+        return f'sha256:{hashlib.sha256(raw).hexdigest()}'
+    finally:
+        response.close()
 
 
 # uploads a single OCI artifact and returns the content digest
@@ -461,33 +493,65 @@ def process_upload_request(
     inject_ocm_coordinates_into_oci_manifests: bool=False,
     processing_mode: ProcessingMode=ProcessingMode.REGULAR,
 ) -> str:
-    src_ref = replication_resource_element.src_ref
+    src_ref = replication_resource_element.replication_src_ref
     tgt_ref = replication_resource_element.tgt_ref
+    if processing_mode is ProcessingMode.DRY_RUN:
+        return 'sha256:<dummy-digest>'
+    reusable = _reusable_upload(
+        replication_resource_element, replication_mode, platform_filter,
+        inject_ocm_coordinates_into_oci_manifests,
+    ) and processing_mode is ProcessingMode.REGULAR
+    source_key = (str(src_ref), replication_mode)
 
-    if replication_resource_element.digest:
-        logger.debug(f'{tgt_ref=} exists - skipping upload')
-        return replication_resource_element.digest
+    # Serialize writes to the same target, but reuse only completed results with
+    # matching source provenance. Failed uploads must release their waiting callers.
+    while True:
+        with upload_image_lock:
+            if (
+                reusable and tgt_ref in uploaded_image_refs_to_digests
+                and uploaded_image_refs_to_source_refs.get(tgt_ref) == source_key
+            ):
+                return uploaded_image_refs_to_digests[tgt_ref]
+            if tgt_ref not in uploaded_image_refs_to_ready_events:
+                upload_done_event = threading.Event()
+                uploaded_image_refs_to_ready_events[tgt_ref] = upload_done_event
+                uploaded_image_refs_to_digests.pop(tgt_ref, None)
+                uploaded_image_refs_to_source_refs.pop(tgt_ref, None)
+                break
+            pending = uploaded_image_refs_to_ready_events[tgt_ref]
+        pending.wait()
 
-    # if event is present, upload might still be in progress (done if event is "set")
-    with upload_image_lock:
-        if tgt_ref in uploaded_image_refs_to_ready_events:
-            upload_done_event = uploaded_image_refs_to_ready_events[tgt_ref]
-            wait_for_upload = True
-        else:
-            upload_done_event = threading.Event()
-            uploaded_image_refs_to_ready_events[tgt_ref] = upload_done_event
-            wait_for_upload = False
+    manifest_digest = None
+    try:
+        manifest_digest = _execute_upload_request(
+            replication_resource_element, oci_client, src_ref, tgt_ref,
+            replication_mode, platform_filter, inject_ocm_coordinates_into_oci_manifests,
+            reusable,
+        )
+        return manifest_digest
+    except Exception as e:
+        logger.error(f'error trying to replicate {src_ref=} -> {tgt_ref=}')
+        e.add_note(f'upload: {src_ref=} -> {tgt_ref=}')
+        raise
+    finally:
+        with upload_image_lock:
+            if manifest_digest and reusable:
+                uploaded_image_refs_to_digests[tgt_ref] = manifest_digest
+                uploaded_image_refs_to_source_refs[tgt_ref] = source_key
+            uploaded_image_refs_to_ready_events.pop(tgt_ref, None)
+            upload_done_event.set()
 
-    if wait_for_upload:
-        upload_done_event.wait()
 
-    if tgt_ref in uploaded_image_refs_to_digests:  # digest already present
-        logger.info(f'{tgt_ref=} - was already uploaded by another rule - skipping')
-        return uploaded_image_refs_to_digests[tgt_ref]
-
-    # most common case: tgt has not yet been processed - process and afterwards signal
-    # other threads waiting for upload result that result is ready by setting the event
-
+def _execute_upload_request(
+    replication_resource_element,
+    oci_client,
+    src_ref,
+    tgt_ref,
+    replication_mode,
+    platform_filter,
+    inject_ocm_coordinates_into_oci_manifests,
+    reusable,
+) -> str:
     remove_files = replication_resource_element.remove_files
     remove_file_globs = replication_resource_element.remove_file_globs
     strip_manifest_attributes = replication_resource_element.strip_manifest_attributes
@@ -513,43 +577,38 @@ def process_upload_request(
 
     logger.debug(f'{oci_manifest_annotations=}')
 
-    if processing_mode is ProcessingMode.DRY_RUN:
-        manifest_digest = '<dummy-digest>'
-        uploaded_image_refs_to_digests[tgt_ref] = f'sha256:{manifest_digest}'
-        upload_done_event.set()
-        return f'sha256:{manifest_digest}'
-
-    try:
-        _, patched_tgt_ref, raw_manifest = ctt.oci_util.filter_image(
-            source_ref=src_ref,
-            target_ref=tgt_ref,
-            remove_files=remove_files,
-            remove_file_globs=remove_file_globs,
-            strip_manifest_attributes=strip_manifest_attributes,
-            append_files=append_files,
-            append_mode=append_mode,
-            append_layer_idx=append_layer_idx,
-            mode=replication_mode,
-            platform_filter=platform_filter,
-            oci_client=oci_client,
-            oci_manifest_annotations=oci_manifest_annotations,
+    # A target-discovery hint is usable only for unmodified, qualified content,
+    # and only after checking the actual target bytes against that identity.
+    if (
+        reusable and replication_resource_element.digest == src_ref.tag
+        and src_ref.tag.startswith('sha256:')
+    ):
+        manifest_digest = _verified_existing_manifest(
+            oci_client, tgt_ref, src_ref, replication_mode,
         )
-    except Exception as e:
-        logger.error(
-            f'error trying to replicate {src_ref=} -> {tgt_ref=}'
-        )
-        e.add_note(f'filter_image: {src_ref=} -> {tgt_ref=}')
-        raise e
+        if manifest_digest:
+            return manifest_digest
 
+    _, patched_tgt_ref, raw_manifest = ctt.oci_util.filter_image(
+        source_ref=src_ref,
+        target_ref=tgt_ref,
+        remove_files=remove_files,
+        remove_file_globs=remove_file_globs,
+        strip_manifest_attributes=strip_manifest_attributes,
+        append_files=append_files,
+        append_mode=append_mode,
+        append_layer_idx=append_layer_idx,
+        mode=replication_mode,
+        platform_filter=platform_filter,
+        oci_client=oci_client,
+        oci_manifest_annotations=oci_manifest_annotations,
+    )
+    manifest_digest = f'sha256:{hashlib.sha256(raw_manifest).hexdigest()}'
     if tgt_ref != patched_tgt_ref:
         logger.info(f'finished processing {src_ref=} -> {patched_tgt_ref=} (initial {tgt_ref=})')
     else:
         logger.info(f'finished processing {src_ref=} -> {tgt_ref=}')
-
-    manifest_digest = hashlib.sha256(raw_manifest).hexdigest()
-    uploaded_image_refs_to_digests[tgt_ref] = f'sha256:{manifest_digest}'
-    upload_done_event.set()
-    return f'sha256:{manifest_digest}'
+    return manifest_digest
 
 
 def iter_replication_plan_components(
@@ -907,15 +966,11 @@ def process_replication_plan_step(
                     else:
                         raise
 
-        if digest := replication_resource_element.target.digest:
-            # if resource has a digest we understand, and is an ociArtifact, then we need to
-            # update the digest, because we might have changed the oci-artefact
-            if (
-                digest.hashAlgorithm.upper() == 'SHA-256'
-                and digest.normalisationAlgorithm == ocm.NormalisationAlgorithm.OCI_ARTIFACT_DIGEST
-            ):
-                digest.value = oci_manifest_digest.removeprefix('sha256:')
-                replication_resource_element.target.digest = digest
+        # Set the complete output specification without mutating the source's
+        # digest object, which callers may have shared with the target resource.
+        replication_resource_element.target.digest = ocm.DigestSpec.from_oci_artifact_digest(
+            oci_manifest_digest,
+        )
 
         if replication_resource_element.convert_to_relative_ref:
             # remove host from target ref

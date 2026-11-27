@@ -55,13 +55,17 @@ _CHILD_B_NAME = 'github.com/gardener/test/ctt-sbom-inttest/child-b'
 _VERSION = 'v0.0.0-inttest'
 
 
-def _make_resource(name: str, image_ref: str) -> ocm.Resource:
+def _make_resource(name: str, image_ref: str, oci_client: oc.Client) -> ocm.Resource:
+    qualified_ref = om.OciImageReference(oci_client.to_digest_hash(
+        image_ref, accept=om.MimeTypes.prefer_multiarch,
+    ))
     return ocm.Resource(
         name=name,
         version=_VERSION,
         type='ociImage',
         relation=ocm.ResourceRelation.EXTERNAL,
         access=ocm.OciAccess(imageReference=image_ref),
+        digest=ocm.DigestSpec.from_oci_artifact_digest(qualified_ref.tag),
     )
 
 
@@ -177,17 +181,17 @@ def run(run_id: str):
     child_a_cd = _make_component(
         name=_CHILD_A_NAME,
         ocm_repo=src_ocm_repo,
-        resources=[_make_resource('wolfi-base', _WOLFI_REF)],
+        resources=[_make_resource('wolfi-base', _WOLFI_REF, oci_client)],
     )
     child_b_cd = _make_component(
         name=_CHILD_B_NAME,
         ocm_repo=src_ocm_repo,
-        resources=[_make_resource('busybox', _BUSYBOX_REF)],
+        resources=[_make_resource('busybox', _BUSYBOX_REF, oci_client)],
     )
     root_cd = _make_component(
         name=_ROOT_NAME,
         ocm_repo=src_ocm_repo,
-        resources=[_make_resource('alpine', _ALPINE_REF)],
+        resources=[_make_resource('alpine', _ALPINE_REF, oci_client)],
         refs=[
             ocm.ComponentReference(
                 name='child-a',
