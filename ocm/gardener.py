@@ -16,6 +16,7 @@ import dacite
 import semver
 import yaml
 
+import oci.digest
 import oci.model
 import ocm
 import ocm.access
@@ -465,6 +466,36 @@ a list of `ImageOverwriteDict`s, sorted by `repository` attribute.
 ImageOverwrite = dict
 
 
+def _image_tag_from_resource(
+    image_ref: oci.model.OciImageReference,
+    resource: ocm.Resource,
+) -> str:
+    '''Retain the resource's approved OCI identity when constructing image-vector tags.'''
+    # Inspect the path only: a registry port is not a symbolic image tag.
+    path_without_digest = image_ref.urlparsed.path.rsplit('@', 1)[0]
+    symbolic_tag = path_without_digest.rsplit(':', 1)[1] if ':' in path_without_digest else None
+    access_digest = (
+        oci.digest.DigestVerifier(image_ref.tag, image_ref).expected_digest
+        if image_ref.has_digest_tag else None
+    )
+
+    if resource_digest := resource.digest:
+        algorithm = {'SHA-256': 'sha256', 'SHA-512': 'sha512'}.get(resource_digest.hashAlgorithm)
+        normalisation = resource_digest.normalisationAlgorithm
+        if not algorithm or normalisation != ocm.NormalisationAlgorithm.OCI_ARTIFACT_DIGEST:
+            raise ValueError('Image-vector output requires a supported OCI artifact digest')
+        approved_digest = oci.digest.DigestVerifier(
+            f'{algorithm}:{resource_digest.value}', image_ref,
+        ).expected_digest
+        if access_digest and access_digest != approved_digest:
+            raise oci.digest.DigestMismatchError(approved_digest, access_digest, image_ref)
+        return f'{symbolic_tag}@{approved_digest}' if symbolic_tag else approved_digest
+
+    if access_digest:
+        return f'{symbolic_tag}@{access_digest}' if symbolic_tag else access_digest
+    return image_ref.tag
+
+
 def image_dict_from_image_dict_and_resource(
     component_name: str,
     image: ImageDict,
@@ -477,11 +508,7 @@ def image_dict_from_image_dict_and_resource(
     '''
     image_ref = oci.model.OciImageReference(resource.access.imageReference)
 
-    if image_ref.has_mixed_tag:
-        symbolic, digest = image_ref.parsed_mixed_tag
-        tag = f'{symbolic}@{digest}'
-    else:
-        tag = image_ref.tag
+    tag = _image_tag_from_resource(image_ref, resource)
 
     image_dict = {
         'name': image['name'],
@@ -550,11 +577,7 @@ def oci_image_dict_from_resource(
     image_ref = oci.model.OciImageReference(access.imageReference)
     repository = image_ref.ref_without_tag
 
-    if image_ref.has_mixed_tag:
-        symbolic, digest = image_ref.parsed_mixed_tag
-        tag = f'{symbolic}@{digest}'
-    else:
-        tag = image_ref.tag
+    tag = _image_tag_from_resource(image_ref, resource)
 
     image_dict = {
         'name': name,
@@ -598,7 +621,7 @@ def oci_image_dict_from_resource_regardless_of_label(
     return {
         'name': resource.name,
         'repository': image_ref.ref_without_tag,
-        'tag': image_ref.tag,
+        'tag': _image_tag_from_resource(image_ref, resource),
     }
 
 

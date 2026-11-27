@@ -1,7 +1,9 @@
 import pytest
 
+import oci.digest
 import ocm
 import ocm.gardener as og
+from test._test_utils import content_digest
 
 
 OCI_REPO = ocm.OciOcmRepository(baseUrl='acme.org/ocm')
@@ -36,7 +38,8 @@ def res(
             name='imagevector.gardener.cloud/target-version',
             value='version-from-label',
         ),
-    )
+    ),
+    digest=None,
 ) -> ocm.Resource:
     return ocm.Resource(
         name=name,
@@ -44,6 +47,7 @@ def res(
         type=type,
         access=access,
         labels=labels,
+        digest=digest,
     )
 
 
@@ -202,6 +206,106 @@ def test_image_dict_from_image_dict_and_resource():
         'tag': 'tag',
         'targetVersion': 'tversion',
     }
+
+
+def _image_dict(builder, resource):
+    if builder == 'reference':
+        return og.image_dict_from_image_dict_and_resource(
+            component_name='example.org/component', image={'name': 'example'}, resource=resource,
+        )
+    arguments = {
+        'resource': resource, 'ocm_repo': ocm.OciOcmRepository(baseUrl='registry.example/ocm'),
+    }
+    if builder == 'labelled':
+        return og.oci_image_dict_from_resource(**arguments)
+    return og.oci_image_dict_from_resource_regardless_of_label(**arguments)
+
+
+@pytest.mark.parametrize('builder', ['reference', 'labelled', 'unlabelled'])
+@pytest.mark.parametrize('shape', ['symbolic', 'mixed', 'digest', 'untagged', 'port'])
+def test_image_dict_resource_digest(builder, shape, no_network):
+    expected = content_digest(b'example image manifest')
+    reference = {
+        'symbolic': 'registry.example/image:v1',
+        'mixed': f'registry.example/image:v1@{expected}',
+        'digest': f'registry.example/image@{expected}',
+        'untagged': 'registry.example/image',
+        'port': f'registry.example:5000/image@{expected}',
+    }[shape]
+    resource = res(
+        access=ocm.OciAccess(imageReference=reference),
+        digest=ocm.DigestSpec.from_oci_artifact_digest(expected),
+    )
+    output = _image_dict(builder, resource)
+    assert output['tag'] == (f'v1@{expected}' if shape in ('symbolic', 'mixed') else expected)
+    assert output['repository'] == (
+        'registry.example:5000/image' if shape == 'port' else 'registry.example/image'
+    )
+    assert resource.access.imageReference == reference
+
+
+@pytest.mark.parametrize('builder', ['reference', 'labelled', 'unlabelled'])
+@pytest.mark.parametrize('shape', ['mixed', 'digest'])
+def test_image_dict_reference_consistency(builder, shape, no_network):
+    expected = content_digest(b'example image manifest')
+    other = content_digest(b'other image manifest')
+    tag = ':v1' if shape == 'mixed' else ''
+    resource = res(
+        access=ocm.OciAccess(imageReference=f'registry.example/image{tag}@{other}'),
+        digest=ocm.DigestSpec.from_oci_artifact_digest(expected),
+    )
+    with pytest.raises(oci.digest.DigestMismatchError) as error:
+        _image_dict(builder, resource)
+    assert error.value.expected_digest == expected
+    assert error.value.actual_digest == other
+
+
+@pytest.mark.parametrize('builder', ['reference', 'labelled', 'unlabelled'])
+@pytest.mark.parametrize('field,value', [
+    ('hashAlgorithm', 'SHA-1'),
+    ('normalisationAlgorithm', ocm.NormalisationAlgorithm.GENERIC_BLOB_DIGEST),
+    ('value', 'abcd'),
+])
+def test_image_dict_digest_spec_validation(builder, field, value, no_network):
+    resource = res(digest=ocm.DigestSpec.from_oci_artifact_digest(content_digest(b'example')))
+    setattr(resource.digest, field, value)
+    with pytest.raises(ValueError):
+        _image_dict(builder, resource)
+
+
+@pytest.mark.parametrize('builder', ['reference', 'labelled', 'unlabelled'])
+def test_image_dict_excluded_digest(builder, no_network):
+    resource = res(digest=ocm.ExcludeFromSignatureDigest())
+    with pytest.raises(ValueError, match='supported OCI artifact digest'):
+        _image_dict(builder, resource)
+
+
+@pytest.mark.parametrize('builder', ['labelled', 'unlabelled'])
+@pytest.mark.parametrize('mixed', [False, True])
+def test_image_dict_relative_resource_digest(builder, mixed, no_network):
+    expected = content_digest(b'example image manifest')
+    reference = f'image:v1@{expected}' if mixed else 'image:v1'
+    resource = res(
+        access=ocm.RelativeOciAccess(reference=reference),
+        digest=ocm.DigestSpec.from_oci_artifact_digest(expected),
+    )
+    output = _image_dict(builder, resource)
+    assert output['repository'] == 'registry.example/image'
+    assert output['tag'] == f'v1@{expected}'
+
+
+@pytest.mark.parametrize('builder', ['reference', 'labelled', 'unlabelled'])
+def test_image_dict_sha512_digest(builder, no_network):
+    expected = content_digest(b'example image manifest', 'sha512')
+    resource = res(digest=ocm.DigestSpec.from_oci_artifact_digest(expected))
+    assert _image_dict(builder, resource)['tag'] == f'tag@{expected}'
+
+
+@pytest.mark.parametrize('builder', ['reference', 'labelled', 'unlabelled'])
+def test_image_dict_mixed_reference_without_resource_digest(builder, no_network):
+    expected = content_digest(b'example image manifest')
+    resource = res(access=ocm.OciAccess(imageReference=f'registry.example/image:v1@{expected}'))
+    assert _image_dict(builder, resource)['tag'] == f'v1@{expected}'
 
 
 def test_iter_image_dicts_from_image_dicts_and_resources():

@@ -7,6 +7,7 @@ import sys
 from unittest.mock import Mock
 
 import pytest
+import yaml
 
 import ocm
 import ocm.__main__ as cli
@@ -105,3 +106,51 @@ def test_normalise_exclusion_option(
             cli._normalise(parsed)
     client.blob.assert_not_called()
     client.manifest_raw.assert_not_called()
+
+
+@pytest.mark.parametrize('selection', ['reference', 'labelled', 'unlabelled'])
+def test_image_vector_output(
+    selection, resource_factory, component_descriptor_factory, monkeypatch, capsys,
+):
+    resource = resource_factory()
+    if selection == 'labelled':
+        resource.labels = [ocm.Label(name='imagevector.gardener.cloud/name', value='example')]
+    root = component_descriptor_factory([resource])
+    child = root
+    if selection == 'reference':
+        child = component_descriptor_factory([resource], name='example.org/child')
+        root = component_descriptor_factory()
+        root.component.componentReferences = [ocm.ComponentReference(
+            name='child', componentName=child.component.name, version=child.component.version,
+            labels=[ocm.Label(
+                name='imagevector.gardener.cloud/images', value={'images': [{'name': 'example'}]},
+            )],
+        )]
+
+    def lookup(identity):
+        name = (
+            identity.rsplit(':', 1)[0] if isinstance(identity, str)
+            else getattr(identity, 'componentName', identity.name)
+        )
+        assert name in (root.component.name, child.component.name)
+        return root if name == root.component.name else child
+
+    client = Mock()
+    monkeypatch.setattr(cli.oci.client, 'Client', Mock(return_value=client))
+    monkeypatch.setattr(cli.oci.auth, 'docker_credentials_lookup', Mock(return_value=Mock()))
+    monkeypatch.setattr(
+        cli.ocm.retrieve, 'create_default_component_descriptor_lookup', Mock(return_value=lookup),
+    )
+    monkeypatch.setattr(sys, 'argv', [
+        'ocm', 'image-vector', '--ocm-repository', 'registry.example/ocm',
+        '--root-name', 'example.org/component:1.0.0', '--recursive',
+        '--select-images', 'all' if selection == 'unlabelled' else 'by-label',
+    ])
+    cli.main()
+    output = yaml.safe_load(capsys.readouterr().out)
+    assert len(output['images']) == 1
+    image = output['images'][0]
+    assert image['repository'] == 'registry.example/image'
+    assert image['tag'] == f'v1@sha256:{resource.digest.value}'
+    client.manifest_raw.assert_not_called()
+    client.blob.assert_not_called()
